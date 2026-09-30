@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.2.0-hermes.1
+
+Fork by `Ex8-ca`. Adds [Hermes Agent](https://hermes-agent.nousresearch.com) as an overlay backend.
+
+- New provider `hermes` (alias `hermes-agent`) in both the Python helper (`ask.py`) and the QML agent map (`AskModel.js`); appears in the logo menu when `hermes` is on `PATH`
+- One-shot ask: `hermes chat -Q --oneshot --format text` with `--safe-mode` (overlay default) or `--yolo`; reasoning forced to `low` for snappy overlays (matches Claude's `QUICK_EFFORT`)
+- Session continuity: follow-ups reuse the same Hermes session via `--resume <sid>`, just like Claude / Codex / OpenCode
+- `--temp` and `--safe` semantics line up with the other agents; `--detailed` works (Hermes handles longer answers natively)
+- `--serve` (warm process, streaming deltas) is **not** wired for Hermes yet — Hermes' `--format stream-json` shape is different and the parser lives in `parse_events()`; v2 will add it
+- `manifest.json` plugin id renamed to `io.github.ex8-ca.omasearch` to avoid colliding with the upstream package
+
+Install over the existing plugin (Omarchy keeps the Super+Q bind):
+
+```shell
+omarchy plugin remove io.github.5h3rd1l.omasearch --yes
+omarchy plugin add https://github.com/Ex8-ca/omaSearch.git --enable --yes
+omarchy default agent hermes   # or pick it in the overlay's logo menu
+```
+
 ## 1.1.0
 
 - Security: omaSearch's folders (`~/.local/state/omasearch`, `~/.cache/omasearch`) are created and made private without ever following a symlink (opened with `O_NOFOLLOW`, then `fchmod`), and folders you don't own are refused

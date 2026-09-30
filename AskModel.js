@@ -11,7 +11,8 @@ var PROVIDERS = {
   opencode: { id: "opencode", name: "OpenCode", web: "https://opencode.ai", canAsk: true },
   crush: { id: "crush", name: "Crush", web: "https://crush.xyz", canAsk: true },
   pi: { id: "pi", name: "Pi", web: "", canAsk: true },
-  omp: { id: "omp", name: "Oh My Pi", web: "", canAsk: true }
+  omp: { id: "omp", name: "Oh My Pi", web: "", canAsk: true },
+  hermes: { id: "hermes", name: "Hermes", web: "https://hermes-agent.nousresearch.com", canAsk: true }
 }
 
 var AGENT_RE = /^[a-z0-9][a-z0-9._-]{0,31}$/

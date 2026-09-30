@@ -89,6 +89,7 @@ PROVIDERS = {
     "crush": {"id": "crush", "name": "Crush", "web": "https://crush.xyz", "binary": "crush", "can_ask": True},
     "pi": {"id": "pi", "name": "Pi", "web": "", "binary": "pi", "can_ask": True},
     "omp": {"id": "omp", "name": "Oh My Pi", "web": "", "binary": "omp", "can_ask": True},
+    "hermes": {"id": "hermes", "name": "Hermes", "web": "https://hermes-agent.nousresearch.com", "binary": "hermes", "can_ask": True},
 }
 
 ALIASES = {
@@ -97,6 +98,7 @@ ALIASES = {
     "github-copilot": "copilot",
     "open-code": "opencode",
     "oh-my-pi": "omp",
+    "hermes-agent": "hermes",
 }
 
 AGENT_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,31}$")
@@ -114,7 +116,7 @@ CHILD_ENV_KEYS = ("HOME", "PATH", "USER", "LANG", "LC_ALL", "XDG_RUNTIME_DIR", "
                   "XDG_CURRENT_DESKTOP", "DISPLAY")
 MAX_CHAT_BYTES = 32000
 # Agents whose overlay answers are real, resumable CLI sessions.
-SESSION_AGENTS = ("claude", "codex", "opencode")
+SESSION_AGENTS = ("claude", "codex", "opencode", "hermes")
 SESSION_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 # Commands (installs, updates) can take a while.
 ASK_TIMEOUT_SEC = 600
@@ -261,6 +263,30 @@ def session_invoke(agent: str, prompt: str, model: str, session: str) -> tuple[l
             return argv + ["--no-session-persistence"], raw, ""
         argv += ["--resume", sid] if session else ["--session-id", sid]
         return argv, raw, sid
+    if agent == "hermes":
+        # Hermes chat reads the query from --query-file (see base_invoke_for).
+        # -Q keeps it quiet (no TUI / no spinner noise); --oneshot exits after
+        # one answer. --safe-mode keeps the agent out of destructive tools;
+        # --yolo is the overlay's "trust it" path (matches Claude's
+        # --dangerously-skip-permissions). Reasoning is forced to low for snappy
+        # overlays, just like QUICK_EFFORT does for Claude.
+        from tempfile import mkstemp
+        try:
+            folder = private_dir(MODELS_CACHE_DIR)
+        except OSError:
+            return None
+        try:
+            fd, qpath = mkstemp(dir=folder, prefix="query.", suffix=".txt")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(wrapped.decode("utf-8", "replace"))
+        except OSError:
+            return None
+        perm = "--safe-mode" if SAFE else "--yolo"
+        argv = ["hermes", "chat", "-Q", "--oneshot", "--format", "text",
+                "--reasoning", "low", perm, *model_args, "--query-file", qpath]
+        if session:
+            argv += ["--resume", session]
+        return argv, b"", session
     if agent == "codex":
         if session:
             sandbox = ["-c", 'sandbox_mode="read-only"'] if SAFE else ["--dangerously-bypass-approvals-and-sandbox"]
@@ -280,9 +306,24 @@ def session_invoke(agent: str, prompt: str, model: str, session: str) -> tuple[l
 
 
 def parse_events(agent: str, text: str) -> tuple[str, str, str]:
-    """Answer, session id and error from codex / opencode JSON event lines."""
+    """Answer, session id and error from codex / opencode / hermes output."""
     answer, sid, error = [], "", ""
     for line in text.splitlines():
+        if agent == "hermes":
+            # Hermes' --format text is plain: answer body on stdout, plus a
+            # `session_id: YYYYMMDD_HHMMSS_xxxxxx` marker (stdout or stderr).
+            # No JSON envelope, so parse it before falling back to JSON.
+            # `↻ Resumed session ...` and `↪ restored workspace dir: ...` are
+            # status lines from Hermes, not part of the answer.
+            stripped = line.strip()
+            m = re.match(r"^session_id:\s*(\S+)\s*$", stripped)
+            if m:
+                sid = m.group(1)
+            elif (stripped and not stripped.startswith("Warning:")
+                  and not stripped.startswith("↻ ") and not stripped.startswith("↪ ")
+                  and stripped != "Hermes"):
+                answer.append(line)
+            continue
         try:
             ev = json.loads(line)
         except ValueError:
@@ -312,6 +353,27 @@ def base_invoke_for(agent: str, prompt: str) -> tuple[list[str], bytes] | None:
     """Headless argv plus stdin payload, without a model override."""
     raw = prompt.encode("utf-8")
     wrapped = wrapped_prompt(prompt).encode("utf-8")
+    if agent == "hermes":
+        # Same as the session branch, but never resume and no model override.
+        # Hermes' --oneshot semantics are noisy through stdin (it falls back to
+        # the full TUI banner), so write the prompt to a private temp file and
+        # pass --query-file instead. The temp file lives under omaSearch's
+        # private MODELS_CACHE_DIR, so the prompt never appears on argv.
+        from tempfile import mkstemp  # local import: matches file-local style.
+        try:
+            folder = private_dir(MODELS_CACHE_DIR)
+        except OSError:
+            return None
+        try:
+            fd, qpath = mkstemp(dir=folder, prefix="query.", suffix=".txt")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(wrapped.decode("utf-8", "replace"))
+        except OSError:
+            return None
+        perm = "--safe-mode" if SAFE else "--yolo"
+        argv = ["hermes", "chat", "-Q", "--oneshot", "--format", "text",
+                "--reasoning", "low", perm, "--query-file", qpath]
+        return argv, b""
     if agent == "grok":
         return [
             "grok",
@@ -1011,7 +1073,10 @@ def ask_agent(provider: dict, prompt: str, session: str = "") -> None:
     agent = provider["id"]
     sid = ""
     if agent in SESSION_AGENTS:
-        argv, stdin_data, sid = session_invoke(agent, prompt, selected_model(agent), session)
+        session_invoked = session_invoke(agent, prompt, selected_model(agent), session)
+        if not session_invoked:
+            emit(result(provider, code="failed", error=f"Could not prepare a {name} invocation."))
+        argv, stdin_data, sid = session_invoked
         invoked = (argv, stdin_data)
     else:
         invoked = invoke_for(agent, prompt, selected_model(agent))
@@ -1043,8 +1108,9 @@ def ask_agent(provider: dict, prompt: str, session: str = "") -> None:
     stdout = strip_ansi((proc.stdout or b"").decode("utf-8", "replace")).strip()
     stderr = (proc.stderr or b"").decode("utf-8", "replace").strip()
     event_error = ""
-    if agent in ("codex", "opencode"):
-        stdout, event_sid, event_error = parse_events(agent, stdout)
+    if agent in ("codex", "opencode", "hermes"):
+        # Hermes writes `session_id:` to stderr while the answer goes to stdout.
+        stdout, event_sid, event_error = parse_events(agent, stdout + "\n" + stderr)
         sid = event_sid or sid
     combined = "\n".join(part for part in (stdout, stderr, event_error) if part)
 
