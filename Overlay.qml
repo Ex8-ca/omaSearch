@@ -408,7 +408,7 @@ Item {
   readonly property int logoSize: Math.max(Style.space(22), Style.font.heading)
   readonly property string pluginDir: (manifest && manifest.__sourceDir)
     ? String(manifest.__sourceDir)
-    : (Quickshell.env("HOME") + "/.config/omarchy/plugins/io.github.5h3rd1l.omasearch")
+    : (Quickshell.env("HOME") + "/.config/omarchy/plugins/io.github.ex8-ca.omasearch")
   readonly property string askScript: pluginDir + "/ask.py"
   readonly property string agentFilePath: Quickshell.env("HOME") + "/.config/omarchy/defaults/agent"
   readonly property int maxPrompt: 2000
@@ -934,7 +934,7 @@ Item {
     // Hide the overlay and notify omarchy-shell so IPC state stays in sync.
     root.close()
     if (root.shell && typeof root.shell.hide === "function")
-      root.shell.hide((root.manifest && root.manifest.id) || "io.github.5h3rd1l.omasearch")
+      root.shell.hide((root.manifest && root.manifest.id) || "io.github.ex8-ca.omasearch")
   }
 
   function toggle() {
