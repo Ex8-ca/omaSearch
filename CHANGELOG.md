@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.2.0-hermes.2
+
+Streaming `ask.py --serve` for Hermes.
+
+- `serve()` now branches by selected agent: `_serve_claude()` (unchanged) and the new `_serve_hermes()`.
+- `_serve_hermes()` maps Hermes' `--format stream-json` events onto omaSearch's `kind` event set: `text` → `delta`, `tool_use` → `tool`, `tool_result` → `tool_result`, `result` → `done`. Tool calls are surfaced for the overlay to show, but the overlay's Allow/Deny flow is a no-op for Hermes — `--safe-mode` is the safety gate, mapped from the overlay's Safe mode toggle; `--yolo` is the trust-it path.
+- Multi-turn chat works: each turn restarts Hermes (one prompt per process) with `--resume <sid>` so context carries. The session id is captured from Hermes' `result` event and threaded into the next turn via a shared locked variable.
+- `--safe`, `--temp`, and `--detailed` semantics line up with the other agents. Approval messages from the overlay are answered with `kind: approve_unsupported` so the overlay can hide it.
+- Stderr from Hermes is filtered (`↻ Resumed session`, `↪ restored workspace`, `session_id:` lines are dropped) and the rest is surfaced as `kind: stderr` for logging.
+- `--serve` exit semantics: `kind: exit` is emitted only when the overlay closes stdin, not after every turn.
+
 ## 1.2.0-hermes.1
 
 Fork by `Ex8-ca`. Adds [Hermes Agent](https://hermes-agent.nousresearch.com) as an overlay backend.

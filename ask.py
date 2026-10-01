@@ -44,6 +44,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bounded import MAX_CHILD_BYTES, MAX_PROMPT_BYTES, read_nofollow, read_stdin_prompt, run_bounded
+from tempfile import mkstemp
 
 PROMPT_INTRO = "You are a desktop assistant in a small overlay on the user's Omarchy (Arch Linux + Hyprland) laptop."
 
@@ -695,14 +696,28 @@ def read_shot(path: str) -> tuple[bytes, str] | None:
 
 
 def serve(session: str) -> None:
-    """Keep one Claude process running for a chat, so answers start at once.
+    """Keep one agent process warm for a chat, so answers start at once.
 
-    The overlay starts this when it opens (Claude boots while you type) and
+    The overlay starts this when it opens (the agent boots while you type) and
     writes {"prompt": ..., "image": ...} lines; each answer streams back as
     delta events and ends with a done event. Follow-ups reuse the same process
-    and session. With --safe, every command Claude wants to run is sent to the
-    overlay as an approve event and waits for {"approve": id, "allow": ...}.
+    and session.
+
+    Safe-mode approval only works for Claude today. Hermes handles its own
+    safety policy in --safe-mode; --yolo is the no-questions-asked path. Codex
+    / OpenCode --ask has no approval flow (see --ask notes in the docstring).
     """
+    chosen = selected_agent() or default_agent()
+    if chosen == "hermes":
+        _serve_hermes(session)
+        return
+    # Default: Claude's warm-process path. Codex / OpenCode fall through here
+    # too; --ask covers them and --serve has no streaming backend yet.
+    _serve_claude(session)
+
+
+def _serve_claude(session: str) -> None:
+    """Keep one Claude process warm; stream deltas + safe-mode approvals."""
     lock = threading.Lock()
     write_lock = threading.Lock()
     pending = {}                  # approval request id -> tool input
@@ -814,8 +829,8 @@ def serve(session: str) -> None:
                 for block in (ev.get("message") or {}).get("content") or []:
                     if isinstance(block, dict) and block.get("type") == "tool_result":
                         out({"kind": "tool_result", "id": str(block.get("tool_use_id") or ""),
-                             "output": tool_output_text(block.get("content")),
-                             "error": block.get("is_error") is True})
+                            "output": tool_output_text(block.get("content")),
+                            "error": block.get("is_error") is True})
             elif kind == "result":
                 text = tidy_stream(ev.get("result") or "")
                 if ev.get("is_error") or ev.get("subtype") != "success":
@@ -864,6 +879,242 @@ def serve(session: str) -> None:
         proc.wait(timeout=120)
     except (OSError, subprocess.TimeoutExpired):
         stop()
+
+
+def _serve_hermes(session: str) -> None:
+    """Keep one Hermes process warm; stream text deltas + tool events.
+
+    Hermes' --format stream-json emits one JSON object per line. We ignore
+    anything that is not a JSON object. There is no per-tool approval flow:
+    Hermes owns safety in --safe-mode (read-only-leaning tool policy) and
+    bypasses it entirely in --yolo. Tool calls surface to the user as `tool`
+    / `tool_result` events so the overlay can show them, but the overlay's
+    Allow/Deny gating is a no-op for Hermes.
+
+    Hermes' chat CLI answers exactly one prompt per process. To support the
+    overlay's multi-turn chat, we restart Hermes between turns with --resume
+    so the next prompt is the next turn in the same session. Each turn gets
+    its own thread-bound pump() so events from old and new processes never mix.
+    """
+    lock = threading.Lock()
+
+    def out(obj: dict) -> None:
+        with lock:
+            sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+
+    if not is_installed("hermes"):
+        out({"kind": "exit", "error": "Hermes CLI is not installed."})
+        return
+    perm = "--safe-mode" if SAFE else "--yolo"
+    model = selected_model("hermes")
+    model_args = ["-m", model] if model and MODEL_RE.fullmatch(model) else []
+    env = {k: os.environ[k] for k in CHILD_ENV_KEYS if k in os.environ}
+
+    def stop(*_args) -> None:
+        # Just exit — don't signal anything. The main loop's stdin will close
+        # as the parent goes away; Hermes' SIGPIPE / EOF will tear it down.
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    out({"kind": "ready", "agent": "hermes", "session": "" if TEMP else (session or "")})
+
+    def start_hermes(query_path: str, resume: str) -> tuple[subprocess.Popen, str]:
+        """Spawn a Hermes process for one turn; return (proc, qpath)."""
+        argv = ["hermes", "chat", "--format", "stream-json",
+                "--reasoning", "low", perm, *model_args,
+                "--query-file", query_path]
+        if not TEMP and resume:
+            argv += ["--resume", resume]
+        proc = subprocess.Popen(login_argv(argv), stdin=subprocess.PIPE,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                start_new_session=True, env=env)
+        # Hermes doesn't read stdin in --format stream-json with --query-file.
+        if proc.stdin is not None:
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+        return proc, query_path
+
+    def pump(proc: subprocess.Popen) -> None:
+        """One turn: pump Hermes events from `proc.stdout` to the overlay.
+
+        Each turn runs its own pump in its own thread, so we don't race with
+        a previous turn's pump. Hermes stream-json events: system (init /
+        resume), text (delta), tool_use, tool_result, result.
+        """
+        nonlocal current_session
+        sid_current = current_session
+        for raw in proc.stdout or []:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(ev, dict):
+                continue
+            kind = ev.get("type")
+            if kind == "system":
+                # `init` carries session_id and model; `resumed` carries them too.
+                if ev.get("session_id"):
+                    sid_current = str(ev.get("session_id"))
+                continue
+            if kind == "text":
+                # Streaming delta. Hermes chunks heavily — emit verbatim; the
+                # overlay accumulates the full assistant message itself.
+                text = str(ev.get("text") or "")
+                if text:
+                    out({"kind": "delta", "text": text})
+                continue
+            if kind == "tool_use":
+                name = str(ev.get("name") or "Tool")
+                args = ev.get("input") if isinstance(ev.get("input"), dict) else {}
+                block = {"name": name, "input": args}
+                out({"kind": "tool", "id": str(ev.get("id") or ""),
+                     "name": name, "text": describe_tool(block),
+                     "input": tool_input_text(block)})
+                continue
+            if kind == "tool_result":
+                out({"kind": "tool_result", "id": str(ev.get("id") or ""),
+                     "output": str(ev.get("output") or ""),
+                     "error": ev.get("is_error") is True,
+                     "duration_ms": int(ev.get("duration_ms") or 0)})
+                continue
+            if kind == "result":
+                text = str(ev.get("text") or "")
+                exit_code = int(ev.get("exit_code") or 0)
+                if exit_code != 0 or ev.get("is_error"):
+                    out({"kind": "done", "ok": False, "agent": "hermes",
+                         "error": text or "Hermes did not return an answer."})
+                else:
+                    # Publish the session id to the main loop for --resume on
+                    # the next turn. Hermes sends it on the result event line.
+                    published_sid = str(ev.get("session_id") or sid_current)
+                    if published_sid:
+                        with session_lock:
+                            current_session = published_sid
+                    out({"kind": "done", "ok": True, "agent": "hermes",
+                         "summary": tidy_stream(text),
+                         "session": "" if TEMP else published_sid})
+                continue
+        try:
+            err = (proc.stderr.read() or b"").decode("utf-8", "replace").strip()[-300:] if proc.stderr else ""
+        except (OSError, ValueError):
+            err = ""
+        # Note: do NOT emit a `kind: exit` here — the serve loop will keep
+        # accepting the next prompt. Exit is reserved for the outer shutdown.
+        # Propagate stderr via a one-off `kind: stderr` so the overlay can log
+        # it without killing the chat.
+        # Filter Hermes' resume status / session_id markers so the overlay
+        # doesn't see them as raw stderr noise.
+        cleaned = "\n".join(
+            line for line in err.splitlines()
+            if line and not line.startswith("↻ ")
+            and not line.startswith("↪ ")
+            and not line.startswith("session_id:")
+        ).strip()
+        if cleaned:
+            out({"kind": "stderr", "tail": cleaned})
+        # Exit this turn's pump thread. The main loop keeps reading stdin.
+        return
+
+    def stop_proc(p: subprocess.Popen) -> None:
+        try:
+            os.killpg(p.pid, signal.SIGTERM)
+        except OSError:
+            pass
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+    def write_prompt(prompt: str) -> str:
+        """Write the wrapped prompt to a private temp file; return its path."""
+        try:
+            folder = private_dir(MODELS_CACHE_DIR)
+        except OSError as err:
+            raise RuntimeError("omaSearch state dir unavailable: " + str(err)[:120])
+        qfd, qpath = mkstemp(dir=folder, prefix="serve.query.", suffix=".txt")
+        try:
+            with os.fdopen(qfd, "w", encoding="utf-8") as fh:
+                fh.write(wrapped_prompt(prompt))
+        except BaseException:
+            try:
+                os.unlink(qpath)
+            except OSError:
+                pass
+            raise
+        return qpath
+
+    # Track which session Hermes last used; updated by pump() from the
+    # `result` event and passed back via --resume for the next turn.
+    session_lock = threading.Lock()
+    current_session = session or ""
+
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            # Overlay closed stdin: tear down the chat.
+            out({"kind": "exit", "error": ""})
+            os._exit(0)
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(msg, dict):
+            continue
+        # Approval messages have no semantics for Hermes (no per-tool gating).
+        # Echo back a soft unsupported so the overlay can drop the button.
+        if "approve" in msg:
+            out({"kind": "approve_unsupported", "id": str(msg.get("approve") or "")})
+            continue
+        prompt = str(msg.get("prompt") or "").strip()
+        if not prompt:
+            continue
+        # Drop any image attachment for now: wiring --image to Hermes is a
+        # follow-up. The overlay sends `{"image": "<path>"}`; we ignore it.
+        try:
+            qpath = write_prompt(prompt)
+        except (OSError, RuntimeError) as err:
+            out({"kind": "exit", "error": "Could not write prompt: " + str(err)[:200]})
+            return
+        # Spawn Hermes for this turn with --resume so context carries.
+        # The fresh session id from the previous turn's `result` event is in
+        # `current_session` (locked access — pump() updates it concurrently).
+        with session_lock:
+            resume_sid = current_session
+        try:
+            proc, _ = start_hermes(qpath, resume_sid)
+        except OSError as err:
+            try:
+                os.unlink(qpath)
+            except OSError:
+                pass
+            out({"kind": "exit", "error": "Could not start Hermes: " + str(err)[:200]})
+            return
+        # Each turn is its own thread. We don't reuse a thread across turns
+        # because the old proc's stdout might still be draining after SIGTERM.
+        pump_thread = threading.Thread(target=pump, args=(proc,), daemon=True)
+        pump_thread.start()
+        # Wait for this turn to complete before accepting the next prompt, so
+        # the overlay's prompt queue is serialized.
+        while proc.poll() is None:
+            time.sleep(0.05)
+        # After Hermes exits, join the pump — the `result` event updates
+        # `current_session` and we need that visible before the next turn.
+        pump_thread.join(timeout=2)
+        # After Hermes exits, clean up the prompt file.
+        try:
+            os.unlink(qpath)
+        except OSError:
+            pass
 
 
 CLAUDE_PROJECTS = os.path.expanduser("~/.claude/projects")
