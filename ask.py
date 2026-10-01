@@ -34,6 +34,7 @@ import json
 import os
 import re
 import signal
+import stat
 import subprocess
 import tempfile
 import threading
@@ -695,6 +696,29 @@ def read_shot(path: str) -> tuple[bytes, str] | None:
     return (data, kind) if kind else None
 
 
+def peek_shot(path: str) -> str | None:
+    """Validate and return an image path the overlay attached, without deleting it.
+
+    Hermes reads the image via --image itself, so we only validate: must live
+    inside the overlay's SHOTS_DIR, must have a recognized image extension,
+    must be readable, must be under MAX_IMAGE_BYTES. The file stays in place
+    so Hermes can read it; omaSearch leaves cleanup to its normal shot policy.
+    """
+    if not path:
+        return None
+    real = os.path.realpath(path)
+    shots = os.path.realpath(SHOTS_DIR)
+    if not real.startswith(shots + os.sep) or not real.endswith(IMAGE_EXTS):
+        return None
+    try:
+        st = os.stat(real)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode) or st.st_size > MAX_IMAGE_BYTES or st.st_size == 0:
+        return None
+    return real
+
+
 def serve(session: str) -> None:
     """Keep one agent process warm for a chat, so answers start at once.
 
@@ -920,11 +944,19 @@ def _serve_hermes(session: str) -> None:
     signal.signal(signal.SIGINT, stop)
     out({"kind": "ready", "agent": "hermes", "session": "" if TEMP else (session or "")})
 
-    def start_hermes(query_path: str, resume: str) -> tuple[subprocess.Popen, str]:
-        """Spawn a Hermes process for one turn; return (proc, qpath)."""
+    def start_hermes(query_path: str, resume: str, image_path: str = "") -> tuple[subprocess.Popen, str]:
+        """Spawn a Hermes process for one turn; return (proc, qpath).
+
+        `image_path` is the validated path to a pasted image (peek_shot), or
+        "" if this turn has no image. Hermes reads the file directly via
+        --image; the file must exist at call time and must live in the
+        overlay's SHOTS_DIR (peek_shot enforces both).
+        """
         argv = ["hermes", "chat", "--format", "stream-json",
                 "--reasoning", "low", perm, *model_args,
                 "--query-file", query_path]
+        if image_path:
+            argv += ["--image", image_path]
         if not TEMP and resume:
             argv += ["--resume", resume]
         proc = subprocess.Popen(login_argv(argv), stdin=subprocess.PIPE,
@@ -1078,8 +1110,17 @@ def _serve_hermes(session: str) -> None:
         prompt = str(msg.get("prompt") or "").strip()
         if not prompt:
             continue
-        # Drop any image attachment for now: wiring --image to Hermes is a
-        # follow-up. The overlay sends `{"image": "<path>"}`; we ignore it.
+        # Validate the image path (must live in SHOTS_DIR, under MAX_IMAGE_BYTES).
+        # peek_shot returns the realpath or ""; the file is left in place so
+        # Hermes can read it via --image. We unlink after the turn completes,
+        # so a Hermes crash doesn't leave the file orphaned.
+        image_path = peek_shot(str(msg.get("image") or "")) or ""
+        if msg.get("image") and not image_path:
+            # The overlay attached something we won't accept — tell it.
+            out({"kind": "image_rejected", "reason": "Path is not inside the omaSearch shots folder, has an unsupported extension, or exceeds 5 MB."})
+            # Don't continue: keep the chat alive; the user can retry without
+            # the image.
+            continue
         try:
             qpath = write_prompt(prompt)
         except (OSError, RuntimeError) as err:
@@ -1091,7 +1132,7 @@ def _serve_hermes(session: str) -> None:
         with session_lock:
             resume_sid = current_session
         try:
-            proc, _ = start_hermes(qpath, resume_sid)
+            proc, _ = start_hermes(qpath, resume_sid, image_path)
         except OSError as err:
             try:
                 os.unlink(qpath)
@@ -1110,6 +1151,14 @@ def _serve_hermes(session: str) -> None:
         # After Hermes exits, join the pump — the `result` event updates
         # `current_session` and we need that visible before the next turn.
         pump_thread.join(timeout=2)
+        # Hermes has consumed the image by now (--image reads it eagerly).
+        # Best-effort cleanup of the shot — ignore errors so a missing file
+        # doesn't break the chat.
+        if image_path:
+            try:
+                os.unlink(image_path)
+            except OSError:
+                pass
         # After Hermes exits, clean up the prompt file.
         try:
             os.unlink(qpath)

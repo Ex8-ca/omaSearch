@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.0-hermes.3
+
+Image paste (Ctrl+V) for Hermes in `--serve` mode.
+
+- New `peek_shot(path)` validates an overlay-supplied image without deleting it: path must live in `~/.cache/omasearch/shots`, have a recognized extension, and be under `MAX_IMAGE_BYTES` (5 MB).
+- `_serve_hermes` threads `peek_shot`'s path through `start_hermes`, which appends `--image <path>` to `hermes chat`. Hermes reads the file itself; omaSearch cleans up the shot after the turn completes.
+- A path that fails validation surfaces as `kind: image_rejected` with a human-readable reason; the chat stays alive.
+- `--ask` mode does not accept images (the existing flow doesn't include them).
+
 ## 1.2.0-hermes.2
 
 Streaming `ask.py --serve` for Hermes.
