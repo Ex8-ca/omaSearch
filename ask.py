@@ -234,9 +234,13 @@ def binary_on_path(binary: str) -> bool:
     return proc.returncode == 0 and bool((proc.stdout or b"").strip())
 
 
-def invoke_for(agent: str, prompt: str, model: str = "") -> tuple[list[str], bytes] | None:
-    """Headless argv plus stdin payload. Prompt never appears in argv."""
-    invoked = base_invoke_for(agent, prompt)
+def invoke_for(agent: str, prompt: str, model: str = "", image: str = "") -> tuple[list[str], bytes] | None:
+    """Headless argv plus stdin payload. Prompt never appears in argv.
+
+    `image` is the overlay-validated path to a pasted image (peek_shot), or
+    "" if no image. Currently only wired for Hermes (--image <path>).
+    """
+    invoked = base_invoke_for(agent, prompt, image=image)
     if invoked and model and MODEL_RE.fullmatch(model):
         argv, stdin_data = invoked
         flag = {"claude": "--model", "codex": "-m", "opencode": "-m"}.get(agent)
@@ -248,8 +252,12 @@ def invoke_for(agent: str, prompt: str, model: str = "") -> tuple[list[str], byt
     return invoked
 
 
-def session_invoke(agent: str, prompt: str, model: str, session: str) -> tuple[list[str], bytes, str]:
-    """argv, stdin and session id for a resumable ask; follow-ups send only the new message."""
+def session_invoke(agent: str, prompt: str, model: str, session: str, image: str = "") -> tuple[list[str], bytes, str] | None:
+    """argv, stdin and session id for a resumable ask; follow-ups send only the new message.
+
+    `image` is the overlay-validated image path or ""; currently only
+    wired for Hermes (--image <path>).
+    """
     raw = prompt.encode("utf-8")
     wrapped = wrapped_prompt(prompt).encode("utf-8")
     model_args = ["--model" if agent == "claude" else "-m", model] if model and MODEL_RE.fullmatch(model) else []
@@ -286,6 +294,8 @@ def session_invoke(agent: str, prompt: str, model: str, session: str) -> tuple[l
         perm = "--safe-mode" if SAFE else "--yolo"
         argv = ["hermes", "chat", "-Q", "--oneshot", "--format", "text",
                 "--reasoning", "low", perm, *model_args, "--query-file", qpath]
+        if image:
+            argv += ["--image", image]
         if session:
             argv += ["--resume", session]
         return argv, b"", session
@@ -351,8 +361,11 @@ def parse_events(agent: str, text: str) -> tuple[str, str, str]:
     return "\n".join(a for a in answer if a).strip(), sid, error
 
 
-def base_invoke_for(agent: str, prompt: str) -> tuple[list[str], bytes] | None:
-    """Headless argv plus stdin payload, without a model override."""
+def base_invoke_for(agent: str, prompt: str, image: str = "") -> tuple[list[str], bytes] | None:
+    """Headless argv plus stdin payload, without a model override.
+
+    `image` is the validated image path or ""; only Hermes uses it.
+    """
     raw = prompt.encode("utf-8")
     wrapped = wrapped_prompt(prompt).encode("utf-8")
     if agent == "hermes":
@@ -361,7 +374,8 @@ def base_invoke_for(agent: str, prompt: str) -> tuple[list[str], bytes] | None:
         # the full TUI banner), so write the prompt to a private temp file and
         # pass --query-file instead. The temp file lives under omaSearch's
         # private MODELS_CACHE_DIR, so the prompt never appears on argv.
-        from tempfile import mkstemp  # local import: matches file-local style.
+        # `--image <path>` is appended when an image was supplied; Hermes reads
+        # the file itself.
         try:
             folder = private_dir(MODELS_CACHE_DIR)
         except OSError:
@@ -375,6 +389,8 @@ def base_invoke_for(agent: str, prompt: str) -> tuple[list[str], bytes] | None:
         perm = "--safe-mode" if SAFE else "--yolo"
         argv = ["hermes", "chat", "-Q", "--oneshot", "--format", "text",
                 "--reasoning", "low", perm, "--query-file", qpath]
+        if image:
+            argv += ["--image", image]
         return argv, b""
     if agent == "grok":
         return [
@@ -1366,20 +1382,23 @@ def read_prompt() -> str:
         return ""
 
 
-def ask_agent(provider: dict, prompt: str, session: str = "") -> None:
-    """Call the default agent's CLI and emit a summary or an error."""
+def ask_agent(provider: dict, prompt: str, session: str = "", image: str = "") -> None:
+    """Call the default agent's CLI and emit a summary or an error.
+
+    `image` is the overlay-validated image path or ""; only Hermes uses it.
+    """
     binary = provider.get("binary") or ""
     name = provider["name"]
     agent = provider["id"]
     sid = ""
     if agent in SESSION_AGENTS:
-        session_invoked = session_invoke(agent, prompt, selected_model(agent), session)
+        session_invoked = session_invoke(agent, prompt, selected_model(agent), session, image=image)
         if not session_invoked:
             emit(result(provider, code="failed", error=f"Could not prepare a {name} invocation."))
         argv, stdin_data, sid = session_invoked
         invoked = (argv, stdin_data)
     else:
-        invoked = invoke_for(agent, prompt, selected_model(agent))
+        invoked = invoke_for(agent, prompt, selected_model(agent), image=image)
     if not invoked:
         emit(result(
             provider,
@@ -1401,8 +1420,18 @@ def ask_agent(provider: dict, prompt: str, session: str = "") -> None:
             stdin_data=stdin_data,
         )
     except ValueError:
+        if image:
+            try:
+                os.unlink(image)
+            except OSError:
+                pass
         emit(result(provider, code="failed", error=f"{name} returned too much output."))
     except OSError:
+        if image:
+            try:
+                os.unlink(image)
+            except OSError:
+                pass
         emit(result(provider, code="missing-cli", error=f"Could not start {name}."))
 
     stdout = strip_ansi((proc.stdout or b"").decode("utf-8", "replace")).strip()
@@ -1422,8 +1451,18 @@ def ask_agent(provider: dict, prompt: str, session: str = "") -> None:
 
     summary = tidy_stream(stdout)
     if not summary:
+        if image:
+            try:
+                os.unlink(image)
+            except OSError:
+                pass
         emit(result(provider, code="failed", error=f"{name} returned an empty answer."))
     keep = not TEMP and SESSION_RE.fullmatch(sid or "")
+    if image:
+        try:
+            os.unlink(image)
+        except OSError:
+            pass
     emit(result(provider, ok=True, summary=summary, session=sid if keep else ""))
 
 
@@ -1480,13 +1519,23 @@ def main(argv: list[str]) -> None:
         if agent not in PROVIDERS or not save_selected(agent):
             emit(result(provider_for(agent), code="failed", error="Could not select that agent."))
         emit(result(provider_for(agent), ok=True))
-    chosen = session = ""
-    while len(argv) >= 2 and argv[0] in ("--agent", "--session"):
+    chosen = session = image_arg = ""
+    image_supplied = False
+    while len(argv) >= 2 and argv[0] in ("--agent", "--session", "--image"):
         if argv[0] == "--agent":
             chosen = canonical_agent(argv[1])
+        elif argv[0] == "--image":
+            # Validate up front so a typo doesn't pollute the agent's argv.
+            image_supplied = True
+            image_arg = peek_shot(str(argv[1] or "")) or ""
         elif SESSION_RE.fullmatch(argv[1]):
             session = argv[1]
         argv = argv[2:]
+    # If an image was supplied but peek_shot refused it, refuse the ask.
+    if image_supplied and not image_arg:
+        empty = {"id": "", "name": "AI", "web": "", "binary": "", "can_ask": False}
+        emit(result(empty, code="image-rejected",
+                    error="Image path is not inside the omaSearch shots folder, has an unsupported extension, or exceeds 5 MB."))
     # Sessions are stored per directory; always use $HOME so the terminal finds them.
     os.chdir(os.path.expanduser("~"))
     agent = chosen if chosen in PROVIDERS else (selected_agent() or default_agent())
@@ -1502,7 +1551,7 @@ def main(argv: list[str]) -> None:
         emit(result(provider, ok=True, canAsk=bool(provider.get("can_ask"))))
 
     if argv[0] != "--ask" or len(argv) != 1:
-        emit(result(provider, code="usage", error="Usage: ask.py --ask  (prompt on stdin)"), 2)
+        emit(result(provider, code="usage", error="Usage: ask.py --ask  (prompt on stdin, optional --image <path>)"), 2)
 
     prompt = read_prompt()
     if not prompt:
@@ -1511,7 +1560,7 @@ def main(argv: list[str]) -> None:
     if not provider.get("can_ask"):
         emit(result(provider, code="open-browser", error=f"No overlay backend for {provider['name']}. Open the browser to continue."))
 
-    ask_agent(provider, prompt, session if provider["id"] in SESSION_AGENTS else "")
+    ask_agent(provider, prompt, session if provider["id"] in SESSION_AGENTS else "", image_arg)
 
 
 if __name__ == "__main__":

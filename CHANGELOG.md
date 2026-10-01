@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.2.0-hermes.4
+
+`--ask` with image, plus investigation notes on Hermes' per-tool approval model.
+
+### `--ask --image <path>`
+
+- New `--image <path>` flag on `ask.py --ask`. Validates the path lives in `~/.cache/omasearch/shots`, has a recognized extension, and is under 5 MB (reuses `peek_shot`). If validation fails, emits `code: image-rejected` and a human-readable error; the ask does not run.
+- `invoke_for` and `session_invoke` thread the image path through to `base_invoke_for`, which appends `--image <path>` for Hermes alongside `--query-file`.
+- The shot is unlinked after the ask completes (success or failure) so pasted images don't pile up in `~/.cache/omasearch/shots/`.
+
+### Hermes per-tool approval — investigation notes
+
+Hermes has its own approval model, separate from Claude's per-tool interactive prompts:
+
+- **Hardline blocklist** (`hermes approvals test` → verdict `hardline-deny`, exit 3): always blocked, even under `--yolo`. Recursive `rm`, sudo, disk writes outside `~/.cache`, etc. Matches Claude's behavior under `--permission-mode default` for the truly destructive class.
+- **`ask-approval` verdict** (exit 2): commands Hermes would prompt the user for in an interactive session — `systemctl restart <svc>`, `dd`, disk-copy operations, etc. The prompt happens inside Hermes itself, which assumes a TTY. In `ask.py`'s non-TTY context this hangs the process.
+- **`allow` verdict** (exit 0): no guard matched; runs without a prompt.
+
+Because the prompt happens inside Hermes (not before the tool call), there's no clean way for `ask.py` to relay "Allow / Always / Deny" to the overlay's UI. The overlay's button stays a no-op for Hermes (`kind: approve_unsupported`).
+
+The cleanest faithful design is:
+
+1. `omaSearch`'s Safe mode = `hermes --safe-mode`. This is the **runtime safety tier** and gates what tools Hermes will use, but does NOT prompt per call.
+3. `omaSearch`'s trust-it mode = `hermes --yolo`. Hermes' hardline blocklist still fires (good); the rest runs unprompted.
+4. The overlay's `kind: approve_unsupported` for any approval message keeps the Allow/Deny buttons hidden in the UI — surfacing them would be dishonest about what Hermes can gate.
+
+If a future Hermes CLI gains a stdin-based approval protocol, the overlay's `--safe` flow can become interactive.
+
 ## 1.2.0-hermes.3
 
 Image paste (Ctrl+V) for Hermes in `--serve` mode.
